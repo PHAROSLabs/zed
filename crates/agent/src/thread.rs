@@ -2536,6 +2536,26 @@ impl Thread {
         self.cumulative_token_usage
     }
 
+    pub fn self_cost_usd(&self) -> f64 {
+        let model_id = match &self.model {
+            ThreadModel::Ready(model) => Some(model.id().0),
+            ThreadModel::Unresolved(selection) => Some(selection.model.0.clone()),
+            ThreadModel::Unset => None,
+        };
+        crate::compute_thread_cost_usd(self.cumulative_token_usage, model_id.as_deref())
+    }
+
+    pub fn running_subagent_costs(&self, cx: &App) -> Vec<(acp_v2::SessionId, f64)> {
+        self.running_subagents
+            .iter()
+            .filter_map(|subagent| {
+                let subagent = subagent.upgrade()?;
+                let sub = subagent.read(cx);
+                Some((sub.id().clone(), sub.self_cost_usd()))
+            })
+            .collect()
+    }
+
     /// Maximum input after reserving the selected model's output allowance.
     pub fn input_token_capacity(&self) -> Option<u64> {
         let model = self.model()?;

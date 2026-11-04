@@ -1,6 +1,7 @@
 use crate::{DbThread, DbThreadMetadata, ThreadsDatabase};
 use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::{Result, anyhow};
+use collections::HashMap;
 use futures::{FutureExt, future::Shared};
 use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use util::path_list::PathList;
@@ -11,6 +12,8 @@ impl Global for GlobalThreadStore {}
 
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
+    self_costs: HashMap<acp_v2::SessionId, f64>,
+    child_costs_by_parent: HashMap<acp_v2::SessionId, HashMap<acp_v2::SessionId, f64>>,
     reload_task: Shared<Task<()>>,
 }
 
@@ -32,8 +35,40 @@ impl ThreadStore {
         let reload_task = Self::spawn_reload(cx);
         Self {
             threads: Vec::new(),
+            self_costs: HashMap::default(),
+            child_costs_by_parent: HashMap::default(),
             reload_task,
         }
+    }
+
+    pub fn thread_cost_usd(&self, session_id: &acp_v2::SessionId) -> Option<f64> {
+        let self_cost = self.self_costs.get(session_id).copied().unwrap_or(0.0);
+        let sub_cost: f64 = self
+            .child_costs_by_parent
+            .get(session_id)
+            .map(|children| children.values().copied().sum())
+            .unwrap_or(0.0);
+        let total = self_cost + sub_cost;
+        (total > 0.0).then_some(total)
+    }
+
+    pub fn live_thread_cost_usd(
+        &self,
+        session_id: &acp_v2::SessionId,
+        live_self_cost: f64,
+        running_subagents: &[(acp_v2::SessionId, f64)],
+    ) -> Option<f64> {
+        let mut children = self
+            .child_costs_by_parent
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        for (sub_id, sub_cost) in running_subagents {
+            children.insert(sub_id.clone(), *sub_cost);
+        }
+        let sub_cost: f64 = children.values().copied().sum();
+        let total = live_self_cost + sub_cost;
+        (total > 0.0).then_some(total)
     }
 
     /// Resolves when the most recently initiated reload has completed.
@@ -112,6 +147,8 @@ impl ThreadStore {
             let Ok(all_threads) = database.list_threads().await else {
                 return;
             };
+            let (self_costs, child_costs_by_parent) =
+                database.list_thread_costs().await.unwrap_or_default();
             this.update(cx, |this, cx| {
                 this.threads.clear();
                 for thread in all_threads {
@@ -120,6 +157,8 @@ impl ThreadStore {
                     }
                     this.threads.push(thread);
                 }
+                this.self_costs = self_costs;
+                this.child_costs_by_parent = child_costs_by_parent;
                 cx.notify();
             })
             .ok();
@@ -313,5 +352,71 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, first_id);
         assert_eq!(entries[1].id, second_id);
+    }
+
+    #[gpui::test]
+    async fn test_thread_cost_aggregation_with_subagents(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let parent_id = session_id("parent-thread");
+        let sub_id = session_id("subagent-thread");
+
+        let mut parent_thread = make_thread(
+            "Parent Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+        );
+        parent_thread.model = Some(crate::DbLanguageModel {
+            provider: "Regulaido Gateway".into(),
+            model: "gemini-4-argon".into(),
+        });
+        parent_thread.cumulative_token_usage = language_model::TokenUsage {
+            input_tokens: 100_000,
+            cache_read_input_tokens: 500_000,
+            cache_creation_input_tokens: 0,
+            output_tokens: 10_000,
+        };
+        // gemini-4-argon: (2.00, 0.10, 10.00) -> 0.20 + 0.05 + 0.10 = $0.35
+
+        let mut sub_thread = make_thread(
+            "Subagent Thread",
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 1, 0).unwrap(),
+        );
+        sub_thread.model = Some(crate::DbLanguageModel {
+            provider: "Regulaido Gateway".into(),
+            model: "gemini-3.8-flash".into(),
+        });
+        sub_thread.subagent_context = Some(crate::SubagentContext {
+            parent_thread_id: parent_id.clone(),
+            depth: 1,
+            outcomes: Vec::new(),
+        });
+        sub_thread.cumulative_token_usage = language_model::TokenUsage {
+            input_tokens: 100_000,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            output_tokens: 20_000,
+        };
+        // gemini-3.8-flash: (0.75, 0.075, 3.75) -> 0.075 + 0.075 = $0.15
+
+        let save_parent = thread_store.update(cx, |store, cx| {
+            store.save_thread(parent_id.clone(), parent_thread, PathList::default(), cx)
+        });
+        save_parent.await.unwrap();
+
+        let save_sub = thread_store.update(cx, |store, cx| {
+            store.save_thread(sub_id.clone(), sub_thread, PathList::default(), cx)
+        });
+        save_sub.await.unwrap();
+        cx.run_until_parked();
+
+        let total_cost = thread_store
+            .read_with(cx, |store, _cx| store.thread_cost_usd(&parent_id))
+            .expect("parent thread should have cost");
+        assert!((total_cost - 0.50).abs() < 1e-6, "got {total_cost}");
+        assert_eq!(
+            crate::format_cost_usd(total_cost).as_deref(),
+            Some("$0.50")
+        );
     }
 }

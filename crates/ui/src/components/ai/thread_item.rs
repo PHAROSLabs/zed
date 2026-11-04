@@ -56,6 +56,7 @@ pub struct ThreadItem {
     is_truncated: bool,
     added: Option<usize>,
     removed: Option<usize>,
+    cost: Option<SharedString>,
     project_paths: Option<Arc<[PathBuf]>>,
     project_name: Option<SharedString>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
@@ -91,6 +92,7 @@ impl ThreadItem {
             is_truncated: true,
             added: None,
             removed: None,
+            cost: None,
             project_paths: None,
             project_name: None,
             worktrees: Vec::new(),
@@ -182,6 +184,11 @@ impl ThreadItem {
 
     pub fn removed(mut self, removed: usize) -> Self {
         self.removed = Some(removed);
+        self
+    }
+
+    pub fn cost(mut self, cost: impl Into<SharedString>) -> Self {
+        self.cost = Some(cost.into());
         self
     }
 
@@ -387,6 +394,8 @@ impl RenderOnce for ThreadItem {
         let diff_stat_id = self.id.clone();
         let added_count = self.added.unwrap_or(0);
         let removed_count = self.removed.unwrap_or(0);
+        let cost = self.cost.filter(|c| !c.is_empty());
+        let has_cost = cost.is_some();
 
         let project_paths = self.project_paths.as_ref().and_then(|paths| {
             let paths_str = paths
@@ -425,6 +434,7 @@ impl RenderOnce for ThreadItem {
             || has_project_paths
             || has_worktree
             || has_diff_stats
+            || has_cost
             || has_timestamp;
 
         v_flex()
@@ -596,13 +606,23 @@ impl RenderOnce for ThreadItem {
                         )
                         .when(
                             (has_project_name || has_project_paths || has_worktree)
-                                && (has_diff_stats || has_timestamp),
+                                && (has_diff_stats || has_cost || has_timestamp),
                             |this| this.child(dot_separator()),
                         )
                         .when(has_diff_stats, |this| {
                             this.child(DiffStat::new(diff_stat_id, added_count, removed_count))
                         })
-                        .when(has_diff_stats && has_timestamp, |this| {
+                        .when(has_diff_stats && (has_cost || has_timestamp), |this| {
+                            this.child(dot_separator())
+                        })
+                        .when_some(cost, |this, cost| {
+                            this.child(
+                                Label::new(cost)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        })
+                        .when(has_cost && has_timestamp, |this| {
                             this.child(dot_separator())
                         })
                         .when(has_timestamp, |this| {

@@ -185,8 +185,81 @@ impl SharedThread {
     }
 }
 
+pub fn model_pricing_per_1m(model_id: Option<&str>) -> (f64, f64, f64) {
+    let m = model_id.unwrap_or("").trim().to_ascii_lowercase();
+    if m.contains("gemini-3.8-flash-priority")
+        || m.contains("gemini-3.8-flash_priority")
+        || m.contains("flash-priority")
+        || m.contains("3.8-priority")
+    {
+        (1.35, 0.135, 6.75)
+    } else if m.contains("gemini-3.8-flash")
+        || m.contains("gemini-3.7-flash")
+        || m.contains("gemini-2.5-flash")
+        || m.contains("flash")
+    {
+        (0.75, 0.075, 3.75)
+    } else if m.contains("gemini-4-argon-priority")
+        || m.contains("gemini-4-argon_priority")
+        || m.contains("argon-priority")
+        || m.contains("gemini-4-priority")
+    {
+        (3.60, 0.18, 18.00)
+    } else if m.contains("gemini-4-argon") || m.contains("argon") || m.contains("gemini-4") {
+        (2.00, 0.10, 10.00)
+    } else if m.contains("gpt-6-astra") || m.contains("astra") || m == "gpt-6" {
+        (5.00, 0.50, 15.00)
+    } else if m.contains("gpt-6.1") {
+        (2.00, 0.10, 10.00)
+    } else if m.contains("gpt-5") || m.contains("sol") {
+        (2.50, 0.25, 10.00)
+    } else if m.contains("opus") {
+        (5.00, 0.50, 25.00)
+    } else if m.contains("sonnet") || m.contains("fable") {
+        (3.00, 0.30, 15.00)
+    } else if m.contains("haiku") {
+        (1.00, 0.10, 5.00)
+    } else {
+        (2.00, 0.20, 10.00)
+    }
+}
+
+pub fn compute_thread_cost_usd(
+    usage: language_model::TokenUsage,
+    model_id: Option<&str>,
+) -> f64 {
+    let uncached_in = usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens) as f64;
+    let cached_in = usage.cache_read_input_tokens as f64;
+    let out = usage.output_tokens as f64;
+    if uncached_in == 0.0 && cached_in == 0.0 && out == 0.0 {
+        return 0.0;
+    }
+    let (in_rate, cached_rate, out_rate) = model_pricing_per_1m(model_id);
+    (uncached_in * in_rate + cached_in * cached_rate + out * out_rate) / 1_000_000.0
+}
+
+pub fn format_cost_usd(cost_usd: f64) -> Option<gpui::SharedString> {
+    if cost_usd <= 0.0 || !cost_usd.is_finite() {
+        return None;
+    }
+    if cost_usd < 0.01 {
+        Some(format!("${:.3}", cost_usd).into())
+    } else {
+        Some(format!("${:.2}", cost_usd).into())
+    }
+}
+
 impl DbThread {
     pub const VERSION: &'static str = "0.3.0";
+
+    pub fn self_cost_usd(&self) -> f64 {
+        compute_thread_cost_usd(
+            self.cumulative_token_usage,
+            self.model.as_ref().map(|m| m.model.as_str()),
+        )
+    }
 
     pub fn to_markdown(&self) -> String {
         crate::messages_to_markdown(&self.messages)
@@ -501,6 +574,20 @@ impl ThreadsDatabase {
             .map_err(|e| e.context("Failed to create threads list index"))
             .log_err();
 
+        connection
+            .exec(indoc! {"
+                CREATE TABLE IF NOT EXISTS thread_costs (
+                    id TEXT PRIMARY KEY,
+                    parent_id TEXT,
+                    cost_usd REAL NOT NULL
+                )
+            "})
+            .and_then(|mut create_table| create_table())
+            .map_err(|e| e.context("Failed to create thread_costs table"))
+            .log_err();
+
+        Self::backfill_missing_thread_costs(&connection).log_err();
+
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
@@ -534,6 +621,9 @@ impl ThreadsDatabase {
             .subagent_context
             .as_ref()
             .map(|ctx| ctx.parent_thread_id.0.clone());
+        let cost_usd = thread.self_cost_usd();
+        let cost_id = id.0.clone();
+        let cost_parent_id = parent_id.clone();
         let serialized_folder_paths = folder_paths.serialize();
         let (folder_paths_str, folder_paths_order_str): (Option<String>, Option<String>) =
             if folder_paths.is_empty() {
@@ -584,6 +674,16 @@ impl ThreadsDatabase {
             data,
             created_at,
         ))?;
+
+        if let Ok(mut upsert_cost) = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, f64)>(indoc! {"
+            INSERT INTO thread_costs (id, parent_id, cost_usd)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                cost_usd = excluded.cost_usd
+        "}) {
+            upsert_cost((cost_id, cost_parent_id, cost_usd)).ok();
+        }
 
         Ok(())
     }
@@ -760,6 +860,9 @@ impl ThreadsDatabase {
                 let mut delete = connection.exec_bound::<Arc<str>>(indoc! {"
                     DELETE FROM threads WHERE id = ?
                 "})?;
+                let mut delete_cost = connection.exec_bound::<Arc<str>>(indoc! {"
+                    DELETE FROM thread_costs WHERE id = ?
+                "}).ok();
 
                 let mut sandboxed_terminal_temp_dirs = Vec::new();
                 for thread_id in ids_to_delete {
@@ -767,6 +870,9 @@ impl ThreadsDatabase {
                         |(data_type, data)| Self::sandboxed_terminal_temp_dir(data_type, data),
                     ) {
                         sandboxed_terminal_temp_dirs.push(temp_dir);
+                    }
+                    if let Some(delete_cost) = delete_cost.as_mut() {
+                        delete_cost(thread_id.clone()).ok();
                     }
                     delete(thread_id)?;
                 }
@@ -805,6 +911,11 @@ impl ThreadsDatabase {
                 "})?;
 
                 delete(())?;
+                if let Ok(mut delete_costs) = connection.exec_bound::<()>(indoc! {"
+                    DELETE FROM thread_costs
+                "}) {
+                    delete_costs(()).ok();
+                }
 
                 sandboxed_terminal_temp_dirs
             };
@@ -816,7 +927,79 @@ impl ThreadsDatabase {
             Ok(())
         })
     }
+
+    fn backfill_missing_thread_costs(connection: &Connection) -> Result<()> {
+        let mut select_missing = connection.select_bound::<(), (
+            Arc<str>,
+            Option<Arc<str>>,
+            DataType,
+            Vec<u8>,
+        )>(indoc! {"
+            SELECT id, parent_id, data_type, data
+            FROM threads
+            WHERE id NOT IN (SELECT id FROM thread_costs)
+        "})?;
+
+        let missing_rows = select_missing(())?;
+        if missing_rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut upsert_cost = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, f64)>(indoc! {"
+            INSERT INTO thread_costs (id, parent_id, cost_usd)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                cost_usd = excluded.cost_usd
+        "})?;
+
+        for (id, parent_id, data_type, data) in missing_rows {
+            let cost_usd = Self::deserialize_thread(data_type, data)
+                .map(|thread| thread.self_cost_usd())
+                .unwrap_or(0.0);
+            upsert_cost((id, parent_id, cost_usd))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn list_thread_costs(
+        &self,
+    ) -> Task<
+        Result<(
+            HashMap<acp_v2::SessionId, f64>,
+            HashMap<acp_v2::SessionId, HashMap<acp_v2::SessionId, f64>>,
+        )>,
+    > {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_bound::<(), (Arc<str>, Option<Arc<str>>, f64)>(
+                "SELECT id, parent_id, cost_usd FROM thread_costs",
+            )?;
+            let rows = select(())?;
+            let mut self_costs = HashMap::default();
+            let mut child_costs_by_parent: HashMap<
+                acp_v2::SessionId,
+                HashMap<acp_v2::SessionId, f64>,
+            > = HashMap::default();
+            for (id, parent_id, cost_usd) in rows {
+                let sid = acp_v2::SessionId::new(id);
+                if let Some(parent_id) = parent_id {
+                    let parent_sid = acp_v2::SessionId::new(parent_id);
+                    child_costs_by_parent
+                        .entry(parent_sid)
+                        .or_default()
+                        .insert(sid, cost_usd);
+                } else {
+                    self_costs.insert(sid, cost_usd);
+                }
+            }
+            Ok((self_costs, child_costs_by_parent))
+        })
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

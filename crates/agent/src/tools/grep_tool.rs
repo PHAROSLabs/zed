@@ -1,4 +1,6 @@
-use super::{LINE_TRUNCATION_MARKER, MAX_LINE_LEN, append_line_segment};
+use super::append_line_segment;
+#[cfg(test)]
+use super::{LINE_TRUNCATION_MARKER, MAX_LINE_LEN};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use acp_thread::MentionUri;
 use agent_client_protocol::v2::schema as acp;

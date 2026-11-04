@@ -25,6 +25,7 @@ pub(crate) struct ThreadSwitcherThreadEntry {
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
     pub diff_stats: DiffStats,
+    pub cost_usd: Option<f64>,
     pub is_draft: bool,
     pub is_title_generating: bool,
     pub notified: bool,
@@ -162,6 +163,13 @@ impl ThreadSwitcherEntry {
         match self {
             Self::Thread(entry) => entry.diff_stats,
             Self::Terminal(_) => DiffStats::default(),
+        }
+    }
+
+    fn cost_label(&self) -> Option<SharedString> {
+        match self {
+            Self::Thread(entry) => entry.cost_usd.and_then(agent::format_cost_usd),
+            Self::Terminal(_) => None,
         }
     }
 
@@ -400,6 +408,7 @@ impl Render for ThreadSwitcher {
                             .when(diff_stats.lines_removed > 0, |this| {
                                 this.removed(diff_stats.lines_removed as usize)
                             })
+                            .when_some(entry.cost_label(), |this, cost| this.cost(cost))
                             .selected(ix == selected_index)
                             .base_bg(cx.theme().colors().elevated_surface_background)
                             .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {

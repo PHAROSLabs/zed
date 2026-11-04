@@ -2290,6 +2290,7 @@ impl ConversationView {
                         active.update_turn_tokens(*update, cx);
                     });
                 }
+                cx.emit(StateChange);
             }
             AcpThreadEvent::AvailableCommandsUpdated(available_commands) => {
                 if let Some(thread_view) = self.thread_view(&session_id) {

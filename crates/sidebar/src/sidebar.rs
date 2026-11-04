@@ -210,6 +210,7 @@ struct ActiveThreadInfo {
     is_background: bool,
     is_title_generating: bool,
     diff_stats: DiffStats,
+    cost_usd: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -363,6 +364,7 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    cost_usd: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -389,6 +391,9 @@ impl ThreadEntry {
         self.is_background = info.is_background;
         self.is_title_generating = info.is_title_generating;
         self.diff_stats = info.diff_stats;
+        if info.cost_usd.is_some() {
+            self.cost_usd = info.cost_usd;
+        }
     }
 }
 
@@ -926,6 +931,13 @@ impl Sidebar {
             this.schedule_update_entries(false, cx);
         })
         .detach();
+
+        if let Some(thread_store) = ThreadStore::try_global(cx) {
+            cx.observe(&thread_store, |this, _store, cx| {
+                this.schedule_update_entries(false, cx);
+            })
+            .detach();
+        }
 
         cx.observe(
             &TerminalThreadMetadataStore::global(cx),
@@ -1631,6 +1643,7 @@ impl Sidebar {
 
             if should_load_threads {
                 let thread_store = ThreadMetadataStore::global(cx);
+                let native_thread_store = ThreadStore::try_global(cx);
 
                 let make_thread_entry =
                     |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
@@ -1641,6 +1654,11 @@ impl Sidebar {
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
                         let draft = row.is_draft().then_some(DraftKind::WithContent);
+                        let cost_usd = row.session_id.as_ref().and_then(|sid| {
+                            native_thread_store
+                                .as_ref()
+                                .and_then(|store| store.read(cx).thread_cost_usd(sid))
+                        });
                         Arc::new(ThreadEntry {
                             metadata: row,
                             icon,
@@ -1654,6 +1672,7 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            cost_usd,
                         })
                     };
 
@@ -5935,6 +5954,7 @@ impl Sidebar {
                             })
                             .collect(),
                         diff_stats: thread.diff_stats,
+                        cost_usd: thread.cost_usd,
                         is_draft: thread.draft.is_some(),
                         is_title_generating: thread.is_title_generating,
                         notified,
@@ -6326,6 +6346,13 @@ impl Sidebar {
             .when(thread.diff_stats.lines_removed > 0, |this| {
                 this.removed(thread.diff_stats.lines_removed as usize)
             })
+            .when_some(
+                (!is_empty_draft)
+                    .then_some(thread.cost_usd)
+                    .flatten()
+                    .and_then(agent::format_cost_usd),
+                |this, cost| this.cost(cost),
+            )
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
@@ -8141,6 +8168,23 @@ fn all_thread_infos_for_workspace(
             };
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
+            let cost_usd = if let Some(native_thread) = thread_view_ref.as_native_thread(cx) {
+                let native_ref = native_thread.read(cx);
+                let live_self_cost = native_ref.self_cost_usd();
+                let running_subagents = native_ref.running_subagent_costs(cx);
+                if let Some(store) = ThreadStore::try_global(cx) {
+                    store
+                        .read(cx)
+                        .live_thread_cost_usd(&session_id, live_self_cost, &running_subagents)
+                } else {
+                    let sub_cost: f64 = running_subagents.iter().map(|(_, c)| *c).sum();
+                    let total = live_self_cost + sub_cost;
+                    (total > 0.0).then_some(total)
+                }
+            } else {
+                ThreadStore::try_global(cx)
+                    .and_then(|store| store.read(cx).thread_cost_usd(&session_id))
+            };
 
             Some(ActiveThreadInfo {
                 session_id,
@@ -8151,6 +8195,7 @@ fn all_thread_infos_for_workspace(
                 is_background,
                 is_title_generating,
                 diff_stats,
+                cost_usd,
             })
         });
 

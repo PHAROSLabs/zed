@@ -661,6 +661,14 @@ impl ThreadsArchiveView {
                 );
 
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
+                let cost_label = thread
+                    .session_id
+                    .as_ref()
+                    .and_then(|sid| {
+                        agent::ThreadStore::try_global(cx)
+                            .and_then(|store| store.read(cx).thread_cost_usd(sid))
+                    })
+                    .and_then(agent::format_cost_usd);
 
                 let base = ThreadItem::new(id, thread.display_title())
                     .base_bg(cx.theme().colors().panel_background)
@@ -673,6 +681,7 @@ impl ThreadsArchiveView {
                     .when_some(icon_from_external_svg, |this, svg| {
                         this.custom_icon_from_external_svg(svg)
                     })
+                    .when_some(cost_label, |this, cost| this.cost(cost))
                     .timestamp(timestamp)
                     .highlight_positions(highlight_positions.clone())
                     .project_paths(thread.folder_paths().paths_owned())
