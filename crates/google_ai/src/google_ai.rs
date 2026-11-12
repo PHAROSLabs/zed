@@ -1049,6 +1049,10 @@ mod tests {
             lowest_thinking_level("gemini-4-argon"),
             Some(ThinkingLevel::Low)
         );
+        assert_eq!(
+            lowest_thinking_level("gemini-4-carbon"),
+            Some(ThinkingLevel::Low)
+        );
         assert_eq!(lowest_thinking_level("gemini-2.5-flash"), None);
     }
 
@@ -1056,6 +1060,7 @@ mod tests {
     fn test_is_versioned_model() {
         assert!(is_versioned_model("gemini-3.1-pro-preview"));
         assert!(is_versioned_model("gemini-4-argon"));
+        assert!(is_versioned_model("gemini-4-carbon"));
         assert!(!is_versioned_model("gemini-flash-latest"));
         assert!(!is_versioned_model("gemini-nano-banana-2.1"));
     }
