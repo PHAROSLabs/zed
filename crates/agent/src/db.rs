@@ -201,11 +201,19 @@ pub fn model_pricing_per_1m(model_id: Option<&str>) -> (f64, f64, f64) {
         (0.75, 0.075, 3.75)
     } else if m.contains("gemini-4-argon-priority")
         || m.contains("gemini-4-argon_priority")
+        || m.contains("gemini-4-carbon-priority")
+        || m.contains("gemini-4-carbon_priority")
         || m.contains("argon-priority")
+        || m.contains("carbon-priority")
         || m.contains("gemini-4-priority")
     {
         (3.60, 0.18, 18.00)
-    } else if m.contains("gemini-4-argon") || m.contains("argon") || m.contains("gemini-4") {
+    } else if m.contains("gemini-4-argon")
+        || m.contains("gemini-4-carbon")
+        || m.contains("argon")
+        || m.contains("carbon")
+        || m.contains("gemini-4")
+    {
         (2.00, 0.10, 10.00)
     } else if m.contains("gpt-6-astra") || m.contains("astra") || m == "gpt-6" {
         (5.00, 0.50, 15.00)
