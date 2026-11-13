@@ -814,6 +814,21 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    dictation_state: DictationState,
+    dictation_error: Option<SharedString>,
+}
+
+enum DictationState {
+    Idle,
+    Recording {
+        #[cfg(feature = "audio")]
+        recording: audio::MicrophoneRecording,
+        started_at: Instant,
+        _timer_task: Task<()>,
+    },
+    Transcribing {
+        _task: Task<()>,
+    },
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1327,6 +1342,8 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            dictation_state: DictationState::Idle,
+            dictation_error: None,
         };
 
         this.sync_reported_activity(cx);
@@ -1410,6 +1427,9 @@ impl ThreadView {
             MessageEditorEvent::Send => self.send(window, cx),
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
             MessageEditorEvent::Cancel => {
+                if self.cancel_dictation(cx) {
+                    return;
+                }
                 if !self.close_thread_search(window, cx) {
                     self.cancel_generation(cx);
                 }
@@ -5580,6 +5600,7 @@ impl ThreadView {
                                     .flex_wrap()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
+                                    .child(self.render_dictation_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
@@ -6930,6 +6951,325 @@ impl ThreadView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_following(window, cx);
             }))
+    }
+
+    fn render_dictation_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
+
+        match &self.dictation_state {
+            DictationState::Idle => {
+                let error_message = self.dictation_error.clone();
+                IconButton::new("dictate-message", IconName::Mic)
+                    .icon_size(IconSize::Small)
+                    .icon_color(if error_message.is_some() {
+                        Color::Error
+                    } else {
+                        Color::Muted
+                    })
+                    .disabled(composer_is_read_only)
+                    .tooltip(move |_window, cx| {
+                        if let Some(error) = error_message.as_ref() {
+                            Tooltip::with_meta(
+                                "Voice Dictation Failed",
+                                Some(&ToggleDictation),
+                                error.clone(),
+                                cx,
+                            )
+                        } else {
+                            Tooltip::with_meta(
+                                "Voice Dictation",
+                                Some(&ToggleDictation),
+                                "Transcribe with Gemini 4 Hydrogen Priority using thread and file context.",
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_dictation(window, cx);
+                    }))
+                    .into_any_element()
+            }
+            DictationState::Recording { started_at, .. } => {
+                let total_seconds = started_at.elapsed().as_secs();
+                let timer_label = format!("{:02}:{:02}", total_seconds / 60, total_seconds % 60);
+                Button::new("dictate-stop", timer_label)
+                    .start_icon(
+                        Icon::new(IconName::Stop)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Tinted(TintColor::Error))
+                    .tooltip(move |_window, cx| {
+                        Tooltip::with_meta(
+                            "Stop & Transcribe",
+                            Some(&ToggleDictation),
+                            "Click again or press action to transcribe; press Esc to cancel.",
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_dictation(window, cx);
+                    }))
+                    .into_any_element()
+            }
+            DictationState::Transcribing { .. } => h_flex()
+                .id("dictate-transcribing")
+                .gap_1()
+                .px_1()
+                .child(loading_contents_spinner(IconSize::Small))
+                .child(
+                    Label::new("Transcribing…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text(
+                    "Transcribing audio with Gemini 4 Hydrogen Priority (Esc to cancel)",
+                ))
+                .into_any_element(),
+        }
+    }
+
+    fn handle_toggle_dictation(
+        &mut self,
+        _: &ToggleDictation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_dictation(window, cx);
+    }
+
+    pub(crate) fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
+            return;
+        }
+        match &self.dictation_state {
+            DictationState::Idle => self.start_dictation(window, cx),
+            DictationState::Recording { .. } => self.stop_and_transcribe_dictation(window, cx),
+            DictationState::Transcribing { .. } => {
+                self.cancel_dictation(cx);
+            }
+        }
+    }
+
+    fn cancel_dictation(&mut self, cx: &mut Context<Self>) -> bool {
+        if matches!(self.dictation_state, DictationState::Idle) {
+            return false;
+        }
+        self.dictation_state = DictationState::Idle;
+        cx.notify();
+        true
+    }
+
+    fn show_dictation_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.dictation_error = Some(message.clone().into());
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                let toast = StatusToast::new(format!("Dictation: {message}"), cx, |this, _cx| {
+                    this.icon(
+                        Icon::new(IconName::MicMute)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                });
+                workspace.toggle_status_toast(toast, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    #[cfg(feature = "audio")]
+    fn collect_dictation_context(&self, cx: &App) -> crate::dictation::DictationContext {
+        let mut workspace_roots = Vec::new();
+        let mut active_file = None;
+
+        if let Some(project) = self.project.upgrade() {
+            let project_ref = project.read(cx);
+            for worktree in project_ref.visible_worktrees(cx) {
+                let root_name = worktree.read(cx).root_name().as_unix_str().to_string();
+                if !root_name.is_empty() {
+                    workspace_roots.push(root_name);
+                }
+            }
+            if let Some(workspace) = self.workspace.upgrade()
+                && let Some(item) = workspace.read(cx).active_item(cx)
+                && let Some(project_path) = item.project_path(cx)
+            {
+                let path = project_path.path.as_unix_str().to_string();
+                if !path.is_empty() {
+                    active_file = Some(path);
+                }
+            }
+        }
+
+        let thread = self.thread.read(cx);
+        let thread_title = thread.title().map(|title| title.to_string());
+        let recent_turns = crate::dictation::extract_recent_turns_from_entries(thread.entries());
+        let draft_text = self.active_editor(cx).read(cx).text(cx);
+
+        crate::dictation::DictationContext {
+            workspace_roots,
+            active_file,
+            thread_title,
+            recent_turns,
+            draft_text,
+        }
+    }
+
+    #[cfg(feature = "audio")]
+    fn insert_dictation_transcript(
+        &mut self,
+        transcript: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active_editor = self.active_editor(cx);
+        active_editor.focus_handle(cx).focus(window, cx);
+        active_editor.update(cx, |message_editor, cx| {
+            message_editor.editor().update(cx, |editor, cx| {
+                let text = editor.text(cx);
+                let cursor_byte_offset = editor
+                    .selections
+                    .newest::<multi_buffer::MultiBufferOffset>(&editor.display_snapshot(cx))
+                    .start
+                    .0;
+                let before_cursor = text.get(..cursor_byte_offset).unwrap_or(text.as_str());
+                let to_insert = if crate::dictation::needs_leading_space(before_cursor, transcript)
+                {
+                    format!(" {transcript}")
+                } else {
+                    transcript.to_string()
+                };
+                editor.insert(&to_insert, window, cx);
+            });
+        });
+    }
+
+    #[cfg(feature = "audio")]
+    fn start_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = crate::dictation::resolve_gateway_config() {
+            self.show_dictation_error(error.to_string(), cx);
+            return;
+        }
+
+        let input_device_id = audio::AudioSettings::get_global(cx)
+            .input_audio_device
+            .clone();
+        let recording = match audio::MicrophoneRecording::start(input_device_id) {
+            Ok(recording) => recording,
+            Err(error) => {
+                self.show_dictation_error(error.to_string(), cx);
+                return;
+            }
+        };
+
+        self.dictation_error = None;
+        let timer_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let still_recording = this
+                    .update(cx, |this, cx| {
+                        if matches!(this.dictation_state, DictationState::Recording { .. }) {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !still_recording {
+                    break;
+                }
+            }
+        });
+
+        self.dictation_state = DictationState::Recording {
+            recording,
+            started_at: Instant::now(),
+            _timer_task: timer_task,
+        };
+        cx.notify();
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn start_dictation(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_dictation_error(
+            "Voice dictation requires Zed's audio feature.".to_string(),
+            cx,
+        );
+    }
+
+    #[cfg(feature = "audio")]
+    fn stop_and_transcribe_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let old_state = std::mem::replace(&mut self.dictation_state, DictationState::Idle);
+        let DictationState::Recording { recording, .. } = old_state else {
+            return;
+        };
+
+        let gateway_config = match crate::dictation::resolve_gateway_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.show_dictation_error(error.to_string(), cx);
+                return;
+            }
+        };
+
+        let Some(http_client) = self
+            .project
+            .upgrade()
+            .map(|project| project.read(cx).client().http_client())
+        else {
+            self.show_dictation_error("No active project HTTP client".to_string(), cx);
+            return;
+        };
+
+        let context = self.collect_dictation_context(cx);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let wav_result = cx
+                .background_executor()
+                .spawn(async move { recording.stop() })
+                .await;
+
+            let transcript_result = match wav_result {
+                Ok(wav_bytes) => {
+                    crate::dictation::transcribe_wav_with_gateway(
+                        http_client,
+                        gateway_config,
+                        wav_bytes,
+                        context,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+
+            if let Err(error) = this.update_in(cx, |this, window, cx| {
+                this.dictation_state = DictationState::Idle;
+                match transcript_result {
+                    Ok(transcript) => {
+                        this.dictation_error = None;
+                        this.insert_dictation_transcript(&transcript, window, cx);
+                    }
+                    Err(error) => {
+                        this.show_dictation_error(error.to_string(), cx);
+                    }
+                }
+                cx.notify();
+            }) {
+                log::warn!("Failed to apply dictation result to ThreadView: {error}");
+            }
+        });
+
+        self.dictation_state = DictationState::Transcribing { _task: task };
+        cx.notify();
+    }
+
+    #[cfg(not(feature = "audio"))]
+    fn stop_and_transcribe_dictation(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.dictation_state = DictationState::Idle;
+        cx.notify();
     }
 }
 
@@ -13983,6 +14323,7 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::handle_toggle_command_pattern))
             .on_action(cx.listener(Self::open_permission_dropdown))
             .on_action(cx.listener(Self::open_add_context_menu))
+            .on_action(cx.listener(Self::handle_toggle_dictation))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
             .on_action(cx.listener(Self::scroll_output_line_up))
