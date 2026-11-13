@@ -12,6 +12,13 @@ pub(super) use cpal::Sample;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, mixer::Mixer, source::Buffered};
 use settings::Settings;
 use std::io::Cursor;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+    mpsc,
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use util::ResultExt;
 
 mod echo_canceller;
@@ -159,6 +166,161 @@ pub fn open_input_stream(
         .open_stream()?;
     log::info!("Opened microphone: {:?}", stream.config());
     Ok(stream)
+}
+
+const DICTATION_SAMPLE_RATE_HZ: u32 = 16_000;
+const MAX_DICTATION_SAMPLES: usize = DICTATION_SAMPLE_RATE_HZ as usize * 60 * 15;
+const MIN_DICTATION_SAMPLES: usize = DICTATION_SAMPLE_RATE_HZ as usize / 3;
+
+pub struct MicrophoneRecording {
+    stop_signal: Arc<AtomicBool>,
+    level_bits: Arc<AtomicU32>,
+    started_at: Instant,
+    join_handle: Option<JoinHandle<anyhow::Result<Vec<i16>>>>,
+}
+
+impl MicrophoneRecording {
+    pub fn start(input_device_id: Option<DeviceId>) -> anyhow::Result<Self> {
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let level_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<anyhow::Result<()>>(1);
+
+        let thread_stop = stop_signal.clone();
+        let thread_level = level_bits.clone();
+        let join_handle = thread::Builder::new()
+            .name("DictationRecorder".to_string())
+            .spawn(move || -> anyhow::Result<Vec<i16>> {
+                let stream = match open_input_stream(input_device_id) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let message = error.to_string();
+                        ready_tx.send(Err(error)).log_err();
+                        return Err(anyhow::anyhow!(message));
+                    }
+                };
+                let Some(target_rate) = std::num::NonZeroU32::new(DICTATION_SAMPLE_RATE_HZ) else {
+                    let error = anyhow::anyhow!("Invalid dictation sample rate");
+                    ready_tx.send(Err(anyhow::anyhow!("{error}"))).log_err();
+                    return Err(error);
+                };
+                let mut resampled = stream
+                    .possibly_disconnected_channels_to_mono()
+                    .constant_samplerate(target_rate);
+
+                ready_tx.send(Ok(())).log_err();
+
+                let mut samples = Vec::with_capacity(DICTATION_SAMPLE_RATE_HZ as usize * 15);
+                let mut chunk_energy = 0.0f32;
+                let mut chunk_count = 0usize;
+
+                'capture: while !thread_stop.load(Ordering::Relaxed)
+                    && samples.len() < MAX_DICTATION_SAMPLES
+                {
+                    for _ in 0..320 {
+                        if thread_stop.load(Ordering::Relaxed)
+                            || samples.len() >= MAX_DICTATION_SAMPLES
+                        {
+                            break 'capture;
+                        }
+                        let Some(sample) = resampled.next() else {
+                            break 'capture;
+                        };
+                        let clamped = sample.clamp(-1.0, 1.0);
+                        samples.push((clamped * i16::MAX as f32) as i16);
+                        chunk_energy += clamped * clamped;
+                        chunk_count += 1;
+                    }
+                    if chunk_count > 0 {
+                        let rms = (chunk_energy / chunk_count as f32).sqrt();
+                        let normalized = (rms * 4.5).clamp(0.0, 1.0);
+                        thread_level.store(normalized.to_bits(), Ordering::Relaxed);
+                        chunk_energy = 0.0;
+                        chunk_count = 0;
+                    }
+                }
+
+                Ok(samples)
+            })
+            .context("Failed to spawn microphone recording thread")?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                stop_signal,
+                level_bits,
+                started_at: Instant::now(),
+                join_handle: Some(join_handle),
+            }),
+            Ok(Err(error)) => {
+                stop_signal.store(true, Ordering::Relaxed);
+                if let Err(join_error) = join_handle.join() {
+                    log::error!("Dictation recorder thread panicked: {join_error:?}");
+                }
+                Err(error)
+            }
+            Err(error) => {
+                stop_signal.store(true, Ordering::Relaxed);
+                if let Err(join_error) = join_handle.join() {
+                    log::error!("Dictation recorder thread panicked: {join_error:?}");
+                }
+                Err(anyhow::anyhow!(
+                    "Microphone recorder initialization interrupted: {error}"
+                ))
+            }
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    pub fn audio_level(&self) -> f32 {
+        f32::from_bits(self.level_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn stop(mut self) -> anyhow::Result<Vec<u8>> {
+        self.stop_signal.store(true, Ordering::Relaxed);
+        let Some(join_handle) = self.join_handle.take() else {
+            anyhow::bail!("Microphone recording already stopped");
+        };
+        let samples = join_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Microphone recording thread panicked"))??;
+        if samples.len() < MIN_DICTATION_SAMPLES {
+            anyhow::bail!("Recording too short");
+        }
+        Ok(encode_pcm_i16_wav(&samples, DICTATION_SAMPLE_RATE_HZ))
+    }
+}
+
+impl Drop for MicrophoneRecording {
+    fn drop(&mut self) {
+        self.stop_signal.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn encode_pcm_i16_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let data_bytes = (samples.len() * std::mem::size_of::<i16>()) as u32;
+    let riff_size = 36u32.saturating_add(data_bytes);
+    let byte_rate = sample_rate.saturating_mul(2);
+
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 pub fn resolve_device(device_id: Option<&DeviceId>, input: bool) -> anyhow::Result<cpal::Device> {
@@ -344,6 +506,24 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| assert!(cx.global::<Audio>().output_error_task.is_some()));
         cx.update(Audio::end_call);
+    }
+
+    #[test]
+    fn test_encode_pcm_i16_wav_header_and_payload() {
+        let samples = [0i16, 1024, -1024, i16::MAX];
+        let wav = encode_pcm_i16_wav(&samples, 16_000);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]), 36 + 8);
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            16_000
+        );
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 8);
+        assert_eq!(wav.len(), 44 + 8);
     }
 
     fn install_output_error_handler(cx: &mut App) -> impl FnMut(Error) + Send + 'static + use<> {

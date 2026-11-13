@@ -11,6 +11,7 @@ mod context;
 mod context_server_configuration;
 pub(crate) mod conversation_view;
 mod diagnostics;
+mod dictation;
 pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
@@ -362,6 +363,8 @@ actions!(
         ResetFastModeWarnings,
         /// Opens the "Add Context" menu in the message editor.
         OpenAddContextMenu,
+        /// Toggles voice dictation in the agent message editor.
+        ToggleDictation,
         /// Interrupts the current generation and sends the message immediately.
         SendImmediately,
         /// Sends the next queued message immediately.

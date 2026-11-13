@@ -16,7 +16,7 @@ pub use audio_pipeline::{ensure_devices_initialized, resolve_device};
 // TODO(audio) replace with input test functionality in the audio crate
 pub use audio_pipeline::RodioExt;
 pub use audio_pipeline::init;
-pub use audio_pipeline::{open_input_stream, open_test_output};
+pub use audio_pipeline::{MicrophoneRecording, open_input_stream, open_test_output};
 
 #[derive(Debug, Copy, Clone, Eq, Hash, PartialEq)]
 pub enum Sound {
