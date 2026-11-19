@@ -218,7 +218,7 @@ fn trim_metadata_range(source: &str, range: Range<usize>) -> Range<usize> {
     start..end
 }
 
-fn is_br_tag(html: &str) -> bool {
+pub(crate) fn is_br_tag(html: &str) -> bool {
     let Some(inner) = html
         .trim()
         .strip_prefix('<')

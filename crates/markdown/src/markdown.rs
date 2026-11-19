@@ -2827,6 +2827,7 @@ impl Element for MarkdownElement {
 
         let mut current_img_block_range: Option<Range<usize>> = None;
         let mut handled_html_block = false;
+        let mut in_br_only_html_block = false;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
@@ -3081,6 +3082,12 @@ impl Element for MarkdownElement {
                             if let Some(block) = parsed_markdown.html_blocks.get(&range.start) {
                                 self.render_html_block(block, &mut builder, markdown_end, cx);
                                 handled_html_block = true;
+                            } else {
+                                let block_html = &parsed_markdown.source[range.clone()];
+                                in_br_only_html_block = !block_html.trim().is_empty()
+                                    && block_html.lines().all(|line| {
+                                        line.trim().is_empty() || parser::is_br_tag(line)
+                                    });
                             }
                         }
                         MarkdownTag::List(bullet_index) => {
@@ -3403,7 +3410,10 @@ impl Element for MarkdownElement {
                         // Pop the parent container.
                         builder.pop_div();
                     }
-                    MarkdownTagEnd::HtmlBlock => builder.pop_div(),
+                    MarkdownTagEnd::HtmlBlock => {
+                        in_br_only_html_block = false;
+                        builder.pop_div();
+                    }
                     MarkdownTagEnd::List(_) => {
                         builder.pop_list();
                         builder.pop_div();
@@ -3490,10 +3500,18 @@ impl Element for MarkdownElement {
                     if builder.html_comment {
                         continue;
                     }
+                    if in_br_only_html_block && parser::is_br_tag(html) {
+                        builder.push_line_break(range.clone());
+                        continue;
+                    }
                     builder.push_text(html, range.clone());
                 }
                 MarkdownEvent::InlineHtml => {
                     let html = &parsed_markdown.source[range.clone()];
+                    if parser::is_br_tag(html) {
+                        builder.push_line_break(range.clone());
+                        continue;
+                    }
                     if let Some(code) = html
                         .strip_prefix("<code>")
                         .and_then(|html| html.strip_suffix("</code>"))
@@ -7773,6 +7791,63 @@ mod tests {
                 "{br} should produce a newline between 'first' and 'second'; got: {text:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn test_br_renders_as_line_break_without_parse_html(cx: &mut TestAppContext) {
+        let table = concat!(
+            "| Model | Score |\n",
+            "|---|---|\n",
+            "| Neon | **~63% @ ~$6.50** (default)<br>~64.5% @ ~$10.70 (max)<br/>~57% @ ~$3.00 (lower) |\n",
+            "| Vals | **70.87% @ $7.40**<br />*(31m 25s)* |\n",
+        );
+        let rendered = render_markdown(table, cx);
+        let all_text: String = rendered
+            .lines
+            .iter()
+            .map(|line| line.layout.wrapped_text())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        assert!(
+            !all_text.contains("<br") && !all_text.contains("<BR"),
+            "<br> tags should not leak literally into rendered table cells; got: {all_text:?}"
+        );
+        assert!(
+            all_text
+                .contains("~63% @ ~$6.50 (default)\n~64.5% @ ~$10.70 (max)\n~57% @ ~$3.00 (lower)"),
+            "table cell <br> tags should produce line breaks; got: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("70.87% @ $7.40\n(31m 25s)"),
+            "table cell <br /> between styled spans should produce a line break; got: {all_text:?}"
+        );
+
+        // Standalone <br> block between paragraphs should not leak literal <br>.
+        let standalone = render_markdown("para one\n\n<br>\n\npara two", cx);
+        let standalone_text: String = standalone
+            .lines
+            .iter()
+            .map(|line| line.layout.wrapped_text())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            !standalone_text.contains("<br>"),
+            "standalone <br> block should not appear as literal text; got: {standalone_text:?}"
+        );
+
+        // Inline code `<br>` and non-<br> HTML tags remain literal when parse_html is disabled.
+        let literal = render_markdown("use `<br>` and <span>keep</span> or <break>", cx);
+        let literal_text: String = literal
+            .lines
+            .iter()
+            .map(|line| line.layout.wrapped_text())
+            .collect();
+        assert!(
+            literal_text.contains("<br>")
+                && literal_text.contains("<span>keep</span>")
+                && literal_text.contains("<break>"),
+            "code spans and non-<br> HTML should remain literal; got: {literal_text:?}"
+        );
     }
 
     #[gpui::test]
